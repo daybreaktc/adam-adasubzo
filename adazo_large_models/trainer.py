@@ -142,6 +142,7 @@ class OurTrainer(Trainer):
         self.eval_samples = eval_samples
         self.writer = writer
         self.p_state = dict()
+        self.zo_subspace_momentum = {}  # r×r momentum buffer per layer (in subspace)
         self.update_steps = 0
         
     def _inner_training_loop(
@@ -326,19 +327,19 @@ class OurTrainer(Trainer):
             self.optimizer = Adam(self.model.parameters(), lr=args.learning_rate)
             # self.optimizer = {name: Adam([param], lr=args.learning_rate) for name, param in self.model.named_parameters()}
             # assert args.lr_scheduler
-            assert args.lr_scheduler_type == 'constant', "we did not implement lr_schedule."
+            assert args.lr_scheduler_type in ('constant', 'cosine'), "only support constant or cosine lr schedule."
         elif args.trainer == "zo_sgd":
             self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate, momentum=args.momentum)
             # self.optimizer = {name: SGD([param], lr=args.learning_rate) for name, param in self.model.named_parameters()}
             # print(f"### args.lr_scheduler: {args.lr_scheduler_type}")
-            assert args.lr_scheduler_type == 'constant', "we did not implement lr_schedule."
+            assert args.lr_scheduler_type in ('constant', 'cosine'), "only support constant or cosine lr schedule."
         elif args.trainer == "subzero_sgd":
             self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate, momentum=args.momentum)
             # self.optimizer = {name: SGD([param], lr=args.learning_rate) for name, param in self.model.named_parameters()}
             # print(f"### args.lr_scheduler: {args.lr_scheduler_type}")
-            assert args.lr_scheduler_type == 'constant', "we did not implement lr_schedule."    
+            assert args.lr_scheduler_type in ('constant', 'cosine'), "only support constant or cosine lr schedule."
         else:
-            assert args.lr_scheduler_type == 'constant', "we did not implement lr_schedule."
+            assert args.lr_scheduler_type in ('constant', 'cosine'), "only support constant or cosine lr schedule."
             if args.optimizer == "adam":
                 self.optimizer = Adam(self.model.parameters(), lr=args.learning_rate)
             elif args.optimizer == "sgd":
@@ -1023,34 +1024,36 @@ class OurTrainer(Trainer):
 
     def train_subspace_basis(self, model, inputs):
         """
-        Phase 1: 学习子空间基底 U 和 V (带 Loss 监控版)
+        Phase 1: 学习子空间基底 U 和 V (切线空间重置 & 偏差修正版)
         """
         args = self.args
+        beta = getattr(args, 'adasub_beta', 0.5) 
         
-        # 1. 初始化 U, V (如果不存在)
-        # 1. Initialize U, V if not exists (Random Init)
+        # 1. 确保 p_state 结构存在
         for name, param in model.named_parameters():
             if param.requires_grad and len(param.shape) == 2:
-                # 修改判断条件：增加 "or self.p_state[name]['U'] is None"
                 if name not in self.p_state or self.p_state[name]['U'] is None:
-                    # Initialize with random gaussian
+                    U_init = torch.randn((param.shape[0], args.gauss_rank), device=param.device, dtype=param.dtype)
+                    V_init = torch.randn((args.gauss_rank, param.shape[1]), device=param.device, dtype=param.dtype)
+                    Q_u, _ = torch.linalg.qr(U_init)
+                    Q_v, _ = torch.linalg.qr(V_init.T)
+                    
                     self.p_state[name] = {
-                        'U': torch.randn((param.shape[0], args.gauss_rank), device=param.device, dtype=param.dtype),
-                        'V': torch.randn((args.gauss_rank, param.shape[1]), device=param.device, dtype=param.dtype)
+                        'U': Q_u[:, :args.gauss_rank].contiguous(),
+                        'V': Q_v[:, :args.gauss_rank].T.contiguous()
                     }
+                
+                # 【核心修复1】：切线空间重置
+                # 每次进入 Phase 1，必须清空历史速度！
+                # 否则经过上一次 QR 分解旋转后的基底，会与残留的旧速度发生坐标系错位。
+                self.p_state[name]['V_U'] = torch.zeros_like(self.p_state[name]['U'])
+                self.p_state[name]['V_V'] = torch.zeros_like(self.p_state[name]['V'])
         
-        # 2. 准备阶段
         model.eval() 
         target_params = [name for name, p in model.named_parameters() if p.requires_grad and len(p.shape) == 2]
     
-        # 【新增】DEBUG: 计算初始 Loss (基准线)
-        # 注意：这一步会多消耗一次 Forward，但为了调试是值得的
-        with torch.no_grad():
-            initial_loss = self.zo_forward(model, inputs)
-        
-        # 3. 优化循环 (Learning Loop)
+        # 2. 优化循环
         for i in range(args.adasub_iter):
-            # ... (这部分采样代码保持不变) ...
             perturbations = {}
             for name in target_params:
                 U = self.p_state[name]['U']
@@ -1058,86 +1061,74 @@ class OurTrainer(Trainer):
                 perturbations[name] = {
                     'Z_U': torch.randn_like(U),
                     'Z_V': torch.randn_like(V),
-                    # 【新增】：为每一层采样一个秩为 gauss_rank 的中心低维随机矩阵 Z_core
-                    'Z_core': torch.randn((args.gauss_rank, args.gauss_rank), device=U.device, dtype=U.dtype)
                 }
     
-            # ... (这部分加扰动代码保持不变) ...
             original_weights = {}
+            
+            # ===== A. 正向扰动 (loss_pos) =====
             for name, param in model.named_parameters():
                 if name in target_params:
                     original_weights[name] = param.data.clone()
                     U_new = self.p_state[name]['U'] + args.adasub_sigma * perturbations[name]['Z_U']
                     V_new = self.p_state[name]['V'] + args.adasub_sigma * perturbations[name]['Z_V']
 
-                    # 【新增】：提取刚才采样的低维随机矩阵
-                    Z_core = perturbations[name]['Z_core']
-                    
-                    # 【修改】：原来是 U_new @ V_new，现在变成 U_new @ Z_core @ V_new
-                    update_matrix = U_new @ Z_core @ V_new
-                    # # scale_matrix 需要确保在文件头部定义了
-                    # update_matrix = U_new @ V_new
-                    # 归一化非常重要，防止数值爆炸
+                    update_matrix = U_new @ V_new
                     norm = torch.norm(update_matrix, p='fro') + 1e-6
                     update_matrix = update_matrix / norm
-                    
                     param.data = param.data + args.adasub_alpha * update_matrix
-    
-            # 计算正向 Loss
+
             loss_pos = self.zo_forward(model, inputs)
-    
-            # ... (这部分还原和反向扰动代码保持不变，为了节省空间省略) ...
-            # 简化的更新逻辑演示：
+
+            # ===== B. 反向扰动 (loss_neg) =====
             for name, param in model.named_parameters():
                 if name in target_params:
-                    param.data = original_weights[name] # 还原
+                    U_new = self.p_state[name]['U'] - args.adasub_sigma * perturbations[name]['Z_U']
+                    V_new = self.p_state[name]['V'] - args.adasub_sigma * perturbations[name]['Z_V']
+
+                    update_matrix = U_new @ V_new
+                    norm = torch.norm(update_matrix, p='fro') + 1e-6
+                    update_matrix = update_matrix / norm
+                    param.data = original_weights[name] + args.adasub_alpha * update_matrix
+                    
+            loss_neg = self.zo_forward(model, inputs)
+    
+            # ===== C. 还原权重并更新 =====
+            for name, param in model.named_parameters():
+                if name in target_params:
+                    param.data = original_weights[name] 
             
-            # 计算梯度 (这里简化演示，实际请用你的完整代码)
-            # 假设我们只用 loss_pos 做梯度指引 (SGD)
-            # grad approx = (loss_pos - initial_loss) / (sigma * alpha) ... 
-            # 实际上直接用 loss 差值做标量指引即可
+            scalar_grad = (loss_pos - loss_neg) / (2 * args.adasub_sigma)
             
-            scalar_grad = (loss_pos - initial_loss) / (args.adasub_sigma) # 粗略估计
+            # 【核心修复2】：偏差修正 (Bias Correction)
+            # 防止在前几步探索时速度累积不够（消除 Warm-up Trap）
+            bias_correction = 1 - beta ** (i + 1)
             
-            # 更新 U, V
             for name in target_params:
-                # Gradient Descent: U = U - lr * grad
-                self.p_state[name]['U'] -= args.adasub_lr * scalar_grad * perturbations[name]['Z_U']
-                self.p_state[name]['V'] -= args.adasub_lr * scalar_grad * perturbations[name]['Z_V']
+                grad_U_approx = scalar_grad * perturbations[name]['Z_U']
+                grad_V_approx = scalar_grad * perturbations[name]['Z_V']
+                
+                # 累积 EMA 速度
+                self.p_state[name]['V_U'] = beta * self.p_state[name]['V_U'] + (1 - beta) * grad_U_approx
+                self.p_state[name]['V_V'] = beta * self.p_state[name]['V_V'] + (1 - beta) * grad_V_approx
+                
+                # 使用修正后的真实速度更新子空间
+                V_U_corrected = self.p_state[name]['V_U'] / bias_correction
+                V_V_corrected = self.p_state[name]['V_V'] / bias_correction
+                
+                self.p_state[name]['U'] -= args.adasub_lr * V_U_corrected
+                self.p_state[name]['V'] -= args.adasub_lr * V_V_corrected
     
-        # 【新增】DEBUG: 计算最终 Loss (验收成果)
-        with torch.no_grad():
-            final_loss = self.zo_forward(model, inputs)
-    
-        # 【核心】打印诊断信息
-        print(f"--> [Phase 1 Debug] Step {self.state.global_step}: "
-              f"Subspace Learning Loss: {initial_loss:.4f} -> {final_loss:.4f} "
-              f"(Delta: {final_loss - initial_loss:.4f})")
-        
-        if final_loss > initial_loss:
-            print(f"    [WARNING] Loss Increased! Subspace Diverged. Try reducing adasub_lr.")
-    
-        # ... (后续的正交化/QR分解代码保持不变) ...
+        # 3. 最终进行 QR 正交化
         for name in target_params:
             with torch.no_grad():
                 U_final = self.p_state[name]['U']
                 V_final = self.p_state[name]['V']
                 
-                # QR Decomposition to get orthogonal bases
                 Q_u, _ = torch.linalg.qr(U_final)
-                Q_v, _ = torch.linalg.qr(V_final)
-                
-                # Update state with orthogonalized bases
-                # Ensure dimensions match (m x r) and (r x n) logic from SubZero
-                # SubZero expects: U (d1, r), V (r, d2). 
-                # NOTE: SubZero code stores V as (r, d2), my code above initialized V as (r, d2).
-                # QR on V.T to maintain shape logic
+                Q_v, _ = torch.linalg.qr(V_final.T)
                 
                 self.p_state[name]['U'] = Q_u[:, :args.gauss_rank].contiguous()
-                # For V (r, n), we do QR on V.T (n, r) -> Q (n, r) -> Q.T (r, n)
-                Q_v, _ = torch.linalg.qr(V_final.T)
                 self.p_state[name]['V'] = Q_v[:, :args.gauss_rank].T.contiguous()
-                
         print(f"Step {self.state.global_step}: Subspace basis (U, V) updated via AdaSub optimization.")
 
 
@@ -1231,7 +1222,6 @@ class OurTrainer(Trainer):
         args = self.args
                 
         # 1. Check if we need to Learn/Update the Subspace (Phase 1)
-        # Initialize at step 0, or update every K steps
         is_time_to_update = (self.state.global_step % args.update_interval == 0)
         
         # Initialize p_state structure if empty
@@ -1242,10 +1232,35 @@ class OurTrainer(Trainer):
                      self.p_state[name] = {'U': None, 'V': None}
 
         if is_time_to_update:
+            # Save old U, V for momentum projection
+            old_UV = {}
+            for name in self.p_state:
+                if self.p_state[name].get('U') is not None:
+                    old_UV[name] = (
+                        self.p_state[name]['U'].clone(),
+                        self.p_state[name]['V'].clone(),
+                    )
+
             # TRIGGER PHASE 1: Learn U and V
             print(f"--> Triggering AdaSub Phase 1: Learning Subspace at step {self.state.global_step}")
             self.train_subspace_basis(model, inputs)
-            
+
+            # Project Phase 2 subspace momentum into the new basis
+            # Old direction in param space: U_old @ m @ V_old
+            # New representation: m_new = (U_new^T @ U_old) @ m @ (V_old @ V_new^T)
+            # Apply damping factor (0.5) to prevent stale momentum from dominating
+            # after a potentially large basis change
+            damping = 0.5
+            for name in list(self.zo_subspace_momentum.keys()):
+                if name in old_UV and name in self.p_state:
+                    U_old, V_old = old_UV[name]
+                    U_new = self.p_state[name]['U']
+                    V_new = self.p_state[name]['V']
+                    m_old = self.zo_subspace_momentum[name]
+                    self.zo_subspace_momentum[name] = damping * (
+                        (U_new.T @ U_old) @ m_old @ (V_old @ V_new.T)
+                    )
+
             # Clear gradient buffer after subspace learning to avoid stale grads affecting Phase 2
             model.zero_grad()
 
@@ -1324,34 +1339,55 @@ class OurTrainer(Trainer):
         # model.zero_grad()
 
     def zo_subspace_update(self, model):
-        
+        """
+        Update parameters with subspace-internal SGD momentum.
+        For 2D params: accumulate projected_grad * z0 in the r×r subspace where
+        directions are consistent across steps, then project back via U @ m @ V.
+        """
         args = self.args
+        beta_m = getattr(args, 'adasub_beta', 0.9)
+
+        # Cosine decay: lr decays from lr_max to 0 over max_steps
+        if args.lr_scheduler_type == 'cosine' and args.max_steps > 0:
+            progress = min(self.state.global_step / args.max_steps, 1.0)
+            lr = args.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
+        else:
+            lr = args.learning_rate
+
         # Set the random seed to ensure that we sample the same z for perturbation/update
         torch.manual_seed(self.zo_random_seed)
         for name, param, U, V in self.named_parameters_to_optim:
-            # Resample z
-            if len(torch.squeeze(param.data).shape) == 2:    
-                z0 = torch.normal(mean=0, std=1, size=(args.gauss_rank, args.gauss_rank), device=param.data.device, dtype=param.data.dtype)
-                # z = U @ z0 @ V * math.sqrt(param.data.numel() / z0.numel())
-                z = (U @ z0 @ V * math.sqrt(param.data.numel() / z0.numel())).view(param.data.shape).to(param.data.dtype)
+            if len(torch.squeeze(param.data).shape) == 2:
+                # Sample z0 in subspace (must match the seed used in perturb)
+                z0 = torch.normal(mean=0, std=1, size=(U.shape[1], V.shape[0]),
+                                  device=param.data.device, dtype=param.data.dtype)
+                scale = math.sqrt(param.data.numel() / z0.numel())
 
+                # SGD-style momentum: m = beta*m + g
+                # Effective update magnitude grows to g/(1-beta) in steady state
+                grad_subspace = self.projected_grad * z0
+                if name not in self.zo_subspace_momentum:
+                    self.zo_subspace_momentum[name] = torch.zeros_like(z0)
+                self.zo_subspace_momentum[name] = (
+                    beta_m * self.zo_subspace_momentum[name] + grad_subspace
+                )
+
+                # Project momentum back to full parameter space and update
+                update = (U @ self.zo_subspace_momentum[name] @ V * scale).view(
+                    param.data.shape).to(param.data.dtype)
+                param.data -= lr * update
             else:
-                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device,
-                             dtype=param.data.dtype)
+                # 1D params (bias/layernorm): standard ZO update via optimizer
+                z = torch.normal(mean=0, std=1, size=param.data.size(),
+                                 device=param.data.device, dtype=param.data.dtype)
+                param.grad = self.projected_grad * z
+                self.optimizer.step()
+                param.grad = None
 
-            param.grad = self.projected_grad * z  # NOTE this q division does not work for q>1.
-            self.optimizer.step()  # will only update grad that is not None.
-            # param.data = param.data - graddiff_times_z / args.q  # NOTE this q division does not work for q>1.
-            param.grad = None  # avoid further update.
-            
         self.update_steps += 1
         if self.update_steps % 1000 == 0:
             print('model update', self.update_steps)
-        # self.optimizer.step()
-        # print(type(self.optimizer), self.optimizer)
-        self.lr_scheduler.step()  # NOTE When we use own optimizer, this will no longer update the lr anymore.
-        # self.optimizer.zero_grad()
-        # model.zero_grad()
+        self.lr_scheduler.step()
         
     @staticmethod
     @torch.no_grad()
